@@ -149,7 +149,7 @@ train_configurations = {
         'Nesterov': True,
         'batch_size': 256,
         'dsn_ratio': 1,
-        'epoch_num': 60,
+        'epoch_num': 5,
         'train_model_prime': True
     },
     'densenet': {
