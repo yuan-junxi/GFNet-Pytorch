@@ -17,6 +17,8 @@ import models.resnet as resnet
 import models.densenet as densenet
 from models import create_model
 
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
 
 parser = argparse.ArgumentParser(description='Training code for GFNet')
 
@@ -162,7 +164,7 @@ def main():
         normalize,
     ]))
     train_set_index = torch.randperm(len(train_set))
-    train_loader = torch.utils.data.DataLoader(train_set, batch_size=256, num_workers=32, pin_memory=False,
+    train_loader = torch.utils.data.DataLoader(train_set, batch_size=256, num_workers=8, pin_memory=False,
                                                sampler=torch.utils.data.sampler.SubsetRandomSampler(
                                                    train_set_index[:]))
 
@@ -172,7 +174,7 @@ def main():
             transforms.CenterCrop(224),
             transforms.ToTensor(),
             normalize, ])),
-        batch_size=train_configuration['batch_size'], shuffle=False, num_workers=32, pin_memory=False)
+        batch_size=train_configuration['batch_size'], shuffle=False, num_workers=8, pin_memory=False)
 
     if args.train_stage != 1:
         state_dim = model_configuration['feature_map_channels'] * math.ceil(args.patch_size / 32) * math.ceil(args.patch_size / 32)
