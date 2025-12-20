@@ -66,6 +66,172 @@ parser.add_argument('--resume', default='', type=str,
 
 args = parser.parse_args()
 
+import torch
+import torch.nn.functional as F
+
+
+class PGDAttack:
+    def __init__(self, model, eps=8 / 255, alpha=2 / 255, steps=20, random_start=True):
+        self.model = model
+        self.eps = eps
+        self.alpha = alpha
+        self.steps = steps
+        self.random_start = random_start
+
+    def perturb(self, images, labels):
+        """
+        生成PGD对抗样本
+        """
+        images_original = images.clone().detach().cuda()
+        images = images.clone().detach().cuda()
+        labels = labels.clone().detach().cuda()
+
+        if self.random_start:
+            # 在[-eps, eps]范围内随机扰动
+            delta = torch.empty_like(images).uniform_(-self.eps, self.eps)
+            images = torch.clamp(images + delta, 0, 1).detach()
+
+        for _ in range(self.steps):
+            images.requires_grad = True
+            outputs = self.model(images)
+
+            # 确保是正确的前向传播
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]  # 如果模型返回(output, state)
+
+            loss = F.cross_entropy(outputs, labels)
+
+            grad = torch.autograd.grad(loss, images,
+                                       retain_graph=False,
+                                       create_graph=False)[0]
+
+            images = images.detach() + self.alpha * grad.sign()
+            # 计算相对于原始图像的扰动
+            delta = images - images_original
+            delta = torch.clamp(delta, -self.eps, self.eps)
+            images = torch.clamp(images_original + delta, 0, 1).detach()
+
+        return images
+
+
+def robust_test(model_prime, model, fc, dataloader, args, memory=None, ppo=None):
+    """
+    进行PGD-20鲁棒测试，适配GFNet的多步骤架构
+    """
+    model_prime.eval()
+    if model:
+        model.eval()
+    if fc:
+        fc.eval()
+
+    correct = 0
+    total = 0
+    batch_time = AverageMeter()
+
+    end = time.time()
+
+    # 创建包装模型，用于PGD攻击
+    class GFNetWrapper(torch.nn.Module):
+        def __init__(self, model_prime, model, fc, args, memory=None, ppo=None):
+            super().__init__()
+            self.model_prime = model_prime
+            self.model = model
+            self.fc = fc
+            self.args = args
+            self.memory = memory
+            self.ppo = ppo
+
+        def forward(self, x):
+            """
+            简化版前向传播，仅用于PGD攻击
+            注意：这里假设仅使用第一步预测
+            """
+            with torch.no_grad():
+                # 获取全局特征
+                if self.args.train_stage == 1:
+                    # stage 1: 仅使用model_prime
+                    output, _ = self.model_prime(x)
+                    if self.fc:
+                        output = self.fc(output, restart=True)
+                else:
+                    # stage 2/3: 使用完整的GFNet流程
+                    # 这里简化处理，仅使用第一步
+                    input_prime = get_prime(x, self.args.patch_size)
+                    output, state = self.model_prime(input_prime)
+
+                    if self.fc:
+                        output = self.fc(output, restart=True)
+
+                    # 如果有多步，这里应该继续，但为简化仅使用第一步
+                    # 实际可以根据需要添加更多步骤
+
+            return output
+
+    # 创建包装模型
+    wrapper_model = GFNetWrapper(model_prime, model, fc, args, memory, ppo).cuda()
+    wrapper_model.eval()
+
+    # 创建PGD攻击器
+    pgd_attack = PGDAttack(wrapper_model, eps=8 / 255, alpha=2 / 255, steps=20)
+
+    for i, (images, labels) in enumerate(dataloader):
+        images = images.cuda()
+        labels = labels.cuda()
+
+        # 生成对抗样本
+        adv_images = pgd_attack.perturb(images, labels)
+
+        # 使用完整的GFNet流程进行评估
+        with torch.no_grad():
+            if args.train_stage == 1:
+                # stage 1: 仅使用model_prime
+                outputs, _ = model_prime(adv_images)
+                if fc:
+                    outputs = fc(outputs, restart=True)
+            else:
+                # stage 2/3: 使用完整的T步流程
+                # 这里需要根据您的validate函数逻辑
+                # 简化起见，我们使用类似的逻辑
+                input_prime = get_prime(adv_images, args.patch_size)
+                output, state = model_prime(input_prime)
+                if fc:
+                    outputs = fc(output, restart=True)
+                else:
+                    outputs = output
+
+                # 多步骤处理（根据实际需求）
+                for patch_step in range(1, args.T):
+                    # 这里需要action selection，简化起见使用随机或固定策略
+                    if ppo and memory:
+                        if patch_step == 1:
+                            action = ppo.select_action(state.to(0), memory, restart_batch=True, training=False)
+                        else:
+                            action = ppo.select_action(state.to(0), memory, training=False)
+                    else:
+                        action = torch.rand(images.size(0), 2).cuda()
+
+                    patches = get_patch(adv_images, action, args.patch_size)
+                    output, state = model(patches)
+                    if fc:
+                        outputs = fc(output, restart=False)
+                    else:
+                        outputs = output
+
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if (i + 1) % args.print_freq == 0:
+            current_acc = 100. * correct / total
+            print(f'Robust Test: [{i + 1}/{len(dataloader)}], '
+                  f'Time {batch_time.ave:.3f}, '
+                  f'Acc: {current_acc:.2f}%')
+
+    robust_acc = 100. * correct / total
+    return robust_acc
 
 def main():
 
@@ -212,6 +378,8 @@ def main():
         start_epoch = 0
         best_acc = 0
 
+    best_robust_acc = 0
+
     for epoch in range(start_epoch, training_epoch_num):
         if args.train_stage != 2:
             print('Training Stage: {}, lr:'.format(args.train_stage))
@@ -223,8 +391,19 @@ def main():
         train(model_prime, model, fc, memory, ppo, optimizer, train_loader, criterion,
               args.print_freq, epoch, train_configuration['batch_size'], record_file, train_configuration, args)
 
-        acc = validate(model_prime, model, fc, memory, ppo, optimizer, val_loader, criterion,
-                       args.print_freq, epoch, train_configuration['batch_size'], record_file, train_configuration, args)
+        # 使用新的验证函数
+        normal_acc, robust_acc = validate_with_robustness(
+            model_prime, model, fc, memory, ppo, val_loader, criterion,
+            args.print_freq, epoch, train_configuration['batch_size'],
+            record_file, train_configuration, args
+        )
+
+        # 可以选择根据正常精度或鲁棒精度保存最佳模型
+        acc = normal_acc  # 或者使用 robust_acc
+
+        # 更新最佳鲁棒精度
+        if robust_acc > best_robust_acc:
+            best_robust_acc = robust_acc
 
         if acc > best_acc:
             best_acc = acc
@@ -237,12 +416,18 @@ def main():
             'model_state_dict': model.module.state_dict(),
             'model_prime_state_dict': model_prime.module.state_dict(),
             'fc': fc.state_dict(),
-            'acc': acc,
+            'acc': normal_acc,
+            'robust_acc': robust_acc,  # 保存鲁棒精度
             'best_acc': best_acc,
+            'best_robust_acc': best_robust_acc,  # 保存最佳鲁棒精度
             'optimizer': optimizer.state_dict() if optimizer else None,
             'ppo_optimizer': ppo.optimizer.state_dict() if ppo else None,
             'policy': ppo.policy.state_dict() if ppo else None,
         }, is_best, checkpoint=record_path)
+
+        # 打印当前最佳精度
+        print(f'Epoch {epoch}: Best Normal Accuracy = {best_acc:.2f}%, '
+              f'Best Robust Accuracy = {best_robust_acc:.2f}%\n')
 
 
 def train(model_prime, model, fc, memory, ppo, optimizer, train_loader, criterion,
@@ -505,6 +690,31 @@ def validate(model_prime, model, fc, memory, ppo, _, val_loader, criterion,
     fd.close()
 
     return top1[args.T - 1].ave
+def validate_with_robustness(model_prime, model, fc, memory, ppo, val_loader,
+                             criterion, print_freq, epoch, batch_size,
+                             record_file, train_configuration, args):
+    """
+    同时进行正常验证和鲁棒验证
+    """
+    # 正常的验证精度
+    print(f"Epoch {epoch}: Starting normal validation...")
+    normal_acc = validate(model_prime, model, fc, memory, ppo, None,
+                          val_loader, criterion, print_freq, epoch,
+                          batch_size, record_file, train_configuration, args)
+
+    # 鲁棒性测试
+    print(f"Epoch {epoch}: Starting PGD-20 robust test...")
+    robust_acc = robust_test(model_prime, model, fc, val_loader, args, memory, ppo)
+
+    # 记录结果
+    fd = open(record_file, 'a+')
+    string = (f'\nEpoch {epoch}: Normal Accuracy = {normal_acc:.2f}%, '
+              f'Robust Accuracy (PGD-20) = {robust_acc:.2f}%\n')
+    print(string)
+    fd.write(string)
+    fd.close()
+
+    return normal_acc, robust_acc
 
 
 
